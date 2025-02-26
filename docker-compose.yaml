@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  seasonality-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seasonality-app
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - .:/app
+      # Create a volume for caching data to improve performance
+      - seasonality-data:/root/.cache
+
+volumes:
+  seasonality-data:

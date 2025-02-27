@@ -7,6 +7,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
+from typing import Union
+
 
 # Set page configuration
 st.set_page_config(
@@ -19,19 +21,19 @@ st.set_page_config(
 st.markdown("""
 <style>
 .main {
-    background-color: #f5f7f9;
+    background-color:rgb(0, 2, 4);
 }
 .stTabs [data-baseweb="tab-list"] {
     gap: 8px;
 }
 .stTabs [data-baseweb="tab"] {
-    background-color: #ffffff;
+    background-color: gray;
     border-radius: 4px;
     padding: 10px 20px;
     box-shadow: 0 1px 2px rgba(0,0,0,0.1);
 }
 .metric-card {
-    background-color: white;
+    background-color: gray;
     border-radius: 8px;
     padding: 20px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
@@ -48,19 +50,35 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # Function to get historical data
-def get_data(ticker, period="5y"):
+def get_data(ticker:str, period:str="5y"):
     """Fetch historical data for a given ticker"""
     try:
+        data = get_local_data(ticker, period)
+        return data
+    except FileNotFoundError as e:
+        # st.error(f":primary[Error fetching data for {ticker}: {e}]")
+        st.error(f"Error fetching data for {ticker}: {e}")
         data = yf.download(ticker, period=period)
         return data
     except Exception as e:
         st.error(f"Error fetching data for {ticker}: {e}")
         return None
 
-# Function to create features
+def get_local_data(ticker:str, period:str) -> Union[pd.DataFrame, None]:
+    try:
+        data = pd.read_csv(f'data/{ticker.upper()}Raw.txt')
+        data['Date'] = pd.to_datetime(data.Date)
+        return data
+    except Exception as e:
+        st.error(f"Error fetching data for {ticker}: {e}")
+        return None
+
+
+# Function to create features with ATR and excursion targets
 def create_features(data):
-    """Create time-based features from DataFrame index"""
+    """Create time-based features and ATR-normalized excursion targets"""
     if data is None or len(data) == 0:
         return None
     
@@ -90,16 +108,61 @@ def create_features(data):
     
     df['trading_days_left'] = df['Date'].apply(trading_days_left)
     
-    # Calculate returns (target variable)
+    # Calculate ATR (Average True Range)
+    df['high_low'] = df['High'] - df['Low']
+    df['high_close'] = np.abs(df['High'] - df['Close'].shift(1))
+    df['low_close'] = np.abs(df['Low'] - df['Close'].shift(1))
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+    df['atr_14'] = df['tr'].rolling(window=14).mean()
+    
+    # Calculate returns (for reference)
     df['return'] = df['Close'].pct_change()
     df['return_5d'] = df['Close'].pct_change(5)
     df['return_20d'] = df['Close'].pct_change(20)
     df['return_60d'] = df['Close'].pct_change(60)
     
-    # Create binary target variables for buy/sell prediction
-    df['target_daily'] = np.where(df['return'].shift(-1) > 0, 1, 0)
-    df['target_monthly'] = np.where(df['return_20d'].shift(-20) > 0, 1, 0)
-    df['target_quarterly'] = np.where(df['return_60d'].shift(-60) > 0, 1, 0)
+    # Calculate forward-looking excursions for different time periods
+    lookforward_periods = [1, 5, 20, 60]
+    
+    for period in lookforward_periods:
+        # Calculate max favorable and adverse excursions
+        rolling_max = df['Close'].rolling(window=period, min_periods=1).max().shift(-period)
+        rolling_min = df['Close'].rolling(window=period, min_periods=1).min().shift(-period)
+        
+        # Handle the last rows where we don't have full forward data
+        # by using the available data only
+        for i in range(1, period):
+            mask = df.index >= (len(df) - i)
+            if i == 1:
+                # For the very last row, use current values (no prediction)
+                rolling_max.loc[mask] = df.loc[mask, 'Close']
+                rolling_min.loc[mask] = df.loc[mask, 'Close']
+            else:
+                # For other near-end rows, use shorter rolling windows
+                temp_max = df.loc[mask, 'Close'].rolling(window=period-i+1, min_periods=1).max()
+                temp_min = df.loc[mask, 'Close'].rolling(window=period-i+1, min_periods=1).min()
+                rolling_max.loc[mask] = temp_max
+                rolling_min.loc[mask] = temp_min
+        
+        # Calculate favorable and adverse excursions (in points)
+        df[f'favorable_exc_{period}d'] = rolling_max - df['Close']
+        df[f'adverse_exc_{period}d'] = df['Close'] - rolling_min
+        
+        # Normalize by ATR
+        df[f'favorable_exc_{period}d_atr'] = df[f'favorable_exc_{period}d'] / df['atr_14']
+        df[f'adverse_exc_{period}d_atr'] = df[f'adverse_exc_{period}d'] / df['atr_14']
+        
+        # Calculate net excursion (favorable - adverse) normalized by ATR
+        df[f'net_exc_{period}d_atr'] = df[f'favorable_exc_{period}d_atr'] - df[f'adverse_exc_{period}d_atr']
+        
+        # Create binary target variables based on ATR-normalized net excursion
+        # If net excursion > 0, it's favorable overall (BUY)
+        df[f'target_{period}d'] = np.where(df[f'net_exc_{period}d_atr'] > 0, 1, 0)
+    
+    # Rename for consistency with previous code
+    df['target_daily'] = df['target_1d']
+    df['target_monthly'] = df['target_20d']
+    df['target_quarterly'] = df['target_60d']
     
     # Drop NA values
     df = df.dropna()
@@ -119,7 +182,7 @@ def train_xgboost_models(df):
     ]
     
     # Train test split - use earlier data for training
-    train_size = int(len(df) * 0.8)
+    train_size = int(len(df) * 0.7)
     train_df = df.iloc[:train_size]
     test_df = df.iloc[train_size:]
     
@@ -191,6 +254,40 @@ def generate_predictions(model, current_features, horizon):
     
     return signal, magnitude
 
+def calculate_expected_excursion(df, model, current_features, period):
+    """Calculate expected favorable and adverse excursions based on model prediction"""
+    if model is None or df is None:
+        return None, None
+    
+    # Get prediction and probability
+    pred_class = model.predict(current_features)[0]
+    pred_proba = model.predict_proba(current_features)[0]
+    
+    # Calculate conditional expectations based on historical data
+    if pred_class == 1:  # BUY prediction
+        # Filter historical data where the target was 1 (BUY)
+        filtered_df = df[df[f'target_{period}d'] == 1]
+        prob = pred_proba[1]
+    else:  # SELL prediction
+        # Filter historical data where the target was 0 (SELL)
+        filtered_df = df[df[f'target_{period}d'] == 0]
+        prob = pred_proba[0]
+    
+    # Calculate average favorable and adverse excursions for this prediction
+    if len(filtered_df) > 0:
+        avg_favorable = filtered_df[f'favorable_exc_{period}d_atr'].mean()
+        avg_adverse = filtered_df[f'adverse_exc_{period}d_atr'].mean()
+    else:
+        # Fallback to full dataset if filtered data is empty
+        avg_favorable = df[f'favorable_exc_{period}d_atr'].mean()
+        avg_adverse = df[f'adverse_exc_{period}d_atr'].mean()
+    
+    # Adjust expectation by probability
+    expected_favorable = avg_favorable * prob
+    expected_adverse = avg_adverse * prob
+    
+    return expected_favorable, expected_adverse
+
 # Function to create the dashboard
 def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
     """Create the dashboard with predictions and visualizations"""
@@ -201,9 +298,14 @@ def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
     latest_data = data.iloc[-1:].copy()
     features = [
         'day_of_week', 'month', 'quarter', 'week_of_year',
+        'trading_day_of_month', 'trading_days_left',
+        'atr_14'  # Include ATR as a feature for display purposes
+    ]
+    prediction_features = [
+        'day_of_week', 'month', 'quarter', 'week_of_year',
         'trading_day_of_month', 'trading_days_left'
     ]
-    current_features = latest_data[features]
+    current_features = latest_data[prediction_features]
     
     # Generate predictions
     daily_signal, daily_magnitude = generate_predictions(daily_model, current_features, "daily")
@@ -233,7 +335,15 @@ def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
         )
         st.plotly_chart(fig, use_container_width=True)
     
-    # Prediction KPIs
+    # Get current ATR value for display
+    current_atr = latest_data['atr_14'].values[0]
+    
+    # Calculate expected excursions
+    daily_favorable, daily_adverse = calculate_expected_excursion(data, daily_model, current_features, 1)
+    monthly_favorable, monthly_adverse = calculate_expected_excursion(data, monthly_model, current_features, 20)
+    quarterly_favorable, quarterly_adverse = calculate_expected_excursion(data, quarterly_model, current_features, 60)
+    
+    # Prediction KPIs with expected excursions
     st.subheader("Seasonality-Based Predictions")
     col1, col2, col3 = st.columns(3)
     
@@ -245,6 +355,9 @@ def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
                 <p class="prediction-{'positive' if daily_signal == 'BUY' else 'negative'}">
                     {daily_signal} (Strength: {daily_magnitude:.2f})
                 </p>
+                <hr style="margin: 10px 0; border-color: #eee;">
+                <p><small>Expected Favorable: {daily_favorable:.2f} ATR ({daily_favorable * current_atr:.2f} points)</small></p>
+                <p><small>Expected Adverse: {daily_adverse:.2f} ATR ({daily_adverse * current_atr:.2f} points)</small></p>
             </div>
             """, 
             unsafe_allow_html=True
@@ -258,6 +371,9 @@ def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
                 <p class="prediction-{'positive' if monthly_signal == 'BUY' else 'negative'}">
                     {monthly_signal} (Strength: {monthly_magnitude:.2f})
                 </p>
+                <hr style="margin: 10px 0; border-color: #eee;">
+                <p><small>Expected Favorable: {monthly_favorable:.2f} ATR ({monthly_favorable * current_atr:.2f} points)</small></p>
+                <p><small>Expected Adverse: {monthly_adverse:.2f} ATR ({monthly_adverse * current_atr:.2f} points)</small></p>
             </div>
             """, 
             unsafe_allow_html=True
@@ -271,10 +387,16 @@ def create_dashboard(ticker, data, daily_model, monthly_model, quarterly_model):
                 <p class="prediction-{'positive' if quarterly_signal == 'BUY' else 'negative'}">
                     {quarterly_signal} (Strength: {quarterly_magnitude:.2f})
                 </p>
+                <hr style="margin: 10px 0; border-color: #eee;">
+                <p><small>Expected Favorable: {quarterly_favorable:.2f} ATR ({quarterly_favorable * current_atr:.2f} points)</small></p>
+                <p><small>Expected Adverse: {quarterly_adverse:.2f} ATR ({quarterly_adverse * current_atr:.2f} points)</small></p>
             </div>
             """, 
             unsafe_allow_html=True
         )
+        
+    # Display current ATR value
+    st.info(f"Current ATR (14): {current_atr:.2f} points")
     
     # Feature importance
     st.subheader("Model Insights")
